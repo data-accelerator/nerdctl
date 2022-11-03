@@ -22,7 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-
+	
+	overlaybdconvert "github.com/containerd/accelerated-container-image/pkg/convertor"
 	"github.com/containerd/containerd/images/converter"
 	"github.com/containerd/containerd/images/converter/uncompress"
 	"github.com/containerd/nerdctl/pkg/platformutil"
@@ -65,6 +66,12 @@ func newImageConvertCommand() *cobra.Command {
 	imageConvertCommand.Flags().Int("estargz-compression-level", gzip.BestCompression, "eStargz compression level")
 	imageConvertCommand.Flags().Int("estargz-chunk-size", 0, "eStargz chunk size")
 	imageConvertCommand.Flags().Bool("zstdchunked", false, "Use zstd compression instead of gzip (a.k.a zstd:chunked). Should be used in conjunction with '--oci'")
+	// #endregion
+
+	// #region overlaybd flags
+	imageConvertCommand.Flags().Bool("overlaybd", false, "Convert tar.gz layers to overlaybd layers")
+	imageConvertCommand.Flags().String("overlaybd-fs-type", "", "Filesystem type for overlaybd")
+	imageConvertCommand.Flags().String("overlaybd-dbstr", "", "Database config string for overlaybd")
 	// #endregion
 
 	// #region generic flags
@@ -134,10 +141,32 @@ func imageConvertAction(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	
+	client, ctx, cancel, err := newClient(cmd)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 
-	if estargz || zstdchunked {
-		if estargz && zstdchunked {
-			return errors.New("option --estargz conflicts with --zstdchunked")
+	overlaybd, err := cmd.Flags().GetBool("overlaybd")
+	if err != nil {
+		return err
+	}
+
+	if estargz || zstdchunked || overlaybd {
+		convertCount := 0
+		if estargz {
+			convertCount++
+		}
+		if zstdchunked {
+			convertCount++
+		}
+		if overlaybd {
+			convertCount++
+		}
+
+		if convertCount > 1 {
+			return errors.New("option --estargz conflicts with --zstdchunked and --overlaybd")
 		}
 
 		esgzOpts, err := getESGZConvertOpts(cmd)
@@ -145,17 +174,25 @@ func imageConvertAction(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		var convertFunc converter.ConvertFunc
+		obdOpts, err := getOBDConvertOpts(cmd)
+		if err != nil {
+			return err
+		}
+		obdOpts = append(obdOpts, overlaybdconvert.WithClient(client))
+		obdOpts = append(obdOpts, overlaybdconvert.WithImageRef(srcRef))
+
 		var convertType string
 		switch {
 		case estargz:
-			convertFunc = estargzconvert.LayerConvertFunc(esgzOpts...)
+			convertOpts = append(convertOpts, converter.WithLayerConvertFunc(estargzconvert.LayerConvertFunc(esgzOpts...)))
 			convertType = "estargz"
 		case zstdchunked:
-			convertFunc = zstdchunkedconvert.LayerConvertFunc(esgzOpts...)
+			convertOpts = append(convertOpts, converter.WithLayerConvertFunc(zstdchunkedconvert.LayerConvertFunc(esgzOpts...)))
 			convertType = "zstdchunked"
+		case overlaybd:
+			convertOpts = append(convertOpts, converter.WithIndexConvertFunc(overlaybdconvert.IndexConvertFunc(obdOpts...)))
+			convertType = "overlaybd"
 		}
-		convertOpts = append(convertOpts, converter.WithLayerConvertFunc(convertFunc))
 
 		if !oci {
 			logrus.Warnf("option --%s should be used in conjunction with --oci", convertType)
@@ -172,12 +209,6 @@ func imageConvertAction(cmd *cobra.Command, args []string) error {
 	if oci {
 		convertOpts = append(convertOpts, converter.WithDockerToOCI(true))
 	}
-
-	client, ctx, cancel, err := newClient(cmd)
-	if err != nil {
-		return err
-	}
-	defer cancel()
 
 	// converter.Convert() gains the lease by itself
 	newImg, err := converter.Convert(ctx, client, targetRef, srcRef, convertOpts...)
@@ -227,6 +258,23 @@ func getESGZConvertOpts(cmd *cobra.Command) ([]estargz.Option, error) {
 		esgzOpts = append(esgzOpts, estargz.WithAllowPrioritizeNotFound(&ignored))
 	}
 	return esgzOpts, nil
+}
+
+func getOBDConvertOpts(cmd *cobra.Command) ([]overlaybdconvert.Option, error) {
+	obdFsType, err := cmd.Flags().GetString("overlaybd-fs-type")
+	if err != nil {
+		return nil, err
+	}
+	obdDbstr, err := cmd.Flags().GetString("overlaybd-dbstr")
+	if err != nil {
+		return nil, err
+	}
+
+	obdOpts := []overlaybdconvert.Option{
+		overlaybdconvert.WithFsType(obdFsType),
+		overlaybdconvert.WithDbstr(obdDbstr),
+	}
+	return obdOpts, nil
 }
 
 func readPathsFromRecordFile(filename string) ([]string, error) {
